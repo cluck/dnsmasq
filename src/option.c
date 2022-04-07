@@ -4024,10 +4024,14 @@ static int one_opt(int option, char *arg, char *errstr, char *gen_err, int comma
 			 "IA32_EFI", "x86-64_EFI", "Xscale_EFI", "BC_EFI",
 			 "ARM32_EFI", "ARM64_EFI", NULL };  
 	 static int boottype = 32768;
+	 char * stype = NULL;
+     char * sbname = NULL;
 	 
 	 new->netid = NULL;
 	 new->sname = NULL;
 	 new->server.s_addr = 0;
+	 new->tftp_server.s_addr = 0;
+	 new->tftp_sname = NULL;
 	 new->netid = dhcp_tags(&arg);
 
 	 if (arg && (comma = split(arg)))
@@ -4060,19 +4064,49 @@ static int one_opt(int option, char *arg, char *errstr, char *gen_err, int comma
 		       }
 		     else
 		       {
+                 if (!strncmp(arg, "type:", 5)) {
+			 	    boottype++;
+					stype = split_chr(arg, ':');
+					if (stype)
+                        sbname = split_chr(stype, ':');
+                    new->basename = opt_string_alloc(sbname ? sbname : "");
+		     		if (atoi_check(stype, &i)) {
+						new->type = i;
+                    }
+              else {
+			 new->type = boottype;
+			 new->basename = opt_string_alloc(arg);
+               }
+                  }
+                 else {
 			 new->type = boottype++;
 			 new->basename = opt_string_alloc(arg);
+                    }
 		       }
-		     
+		    
 		     if (comma)
 		       {
-			 if (!inet_pton(AF_INET, comma, &new->server))
+             arg = comma;
+			 comma = split(arg); 
+			 if (!inet_pton(AF_INET, arg, &new->server))
 			   {
 			     new->server.s_addr = 0;
-			     new->sname = opt_string_alloc(comma);
+			     new->sname = opt_string_alloc(arg);
 			   }
-		       
-		       }
+              if (comma) {
+			  arg = comma;
+		      comma = split(arg);
+			if (!(inet_pton(AF_INET, arg, &new->tftp_server) > 0))
+				{
+					new->tftp_server.s_addr = 0;
+					new->tftp_sname = opt_string_alloc(arg);
+				}
+			else if (new->sname)
+				new->tftp_sname = new->sname;
+			else if (new->server.s_addr)
+				new->tftp_server = new->server;
+			}
+                }
 		   }
 		 
 		 /* Order matters */

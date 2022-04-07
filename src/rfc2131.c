@@ -96,7 +96,8 @@ size_t dhcp_reply(struct dhcp_context *context, char *iface_name, int int_index,
   unsigned char *agent_id = NULL, *uuid = NULL;
   unsigned char *emac = NULL;
   int vendor_class_len = 0, emac_len = 0;
-  struct dhcp_netid known_id, iface_id, cpewan_id;
+  struct dhcp_netid known_id, iface_id, cpewan_id, pxe_req_tag, pxe_type_id;
+  static char pxe_type_tag[10];
   struct dhcp_opt *o;
   unsigned char pxe_uuid[17];
   unsigned char *oui = NULL, *serial = NULL;
@@ -411,6 +412,25 @@ size_t dhcp_reply(struct dhcp_context *context, char *iface_name, int int_index,
 	    }
 	}
     }
+
+  if ((mess_type == DHCPREQUEST || mess_type == DHCPINFORM) &&
+      (opt = option_find(mess, sz, OPTION_VENDOR_CLASS_OPT, 1)) &&
+      (opt = option_find1(option_ptr(opt, 0), option_ptr(opt, option_len(opt)), SUBOPT_PXE_BOOT_ITEM, 4)))
+      {
+	  int type = option_uint(opt, 0, 2);
+	  int layer = option_uint(opt, 2, 2);
+
+	  if (!ignore && !(layer & 0x8000) && type != 0)
+        {
+  snprintf((char *)pxe_type_tag, sizeof(pxe_type_tag),
+    "pxe%d", type);
+  pxe_type_id.net = pxe_type_tag;
+  pxe_req_tag.net = "pxereq";
+  pxe_type_id.next = netid;
+  pxe_req_tag.next = &pxe_type_id;
+  netid = &pxe_req_tag;
+        }
+     }
   
   /* dhcp-match. If we have hex-and-wildcards, look for a left-anchored match.
      Otherwise assume the option is an array, and look for a matching element. 
@@ -855,7 +875,7 @@ size_t dhcp_reply(struct dhcp_context *context, char *iface_name, int int_index,
   /* Can have setting to ignore the client ID for a particular MAC address or hostname */
   if (have_config(config, CONFIG_NOCLID))
     clid = NULL;
-          
+
   /* Check if client is PXE client. */
   if (daemon->enable_pxe &&
       is_pxe_client(mess, sz, &pxevendor))
@@ -896,32 +916,40 @@ size_t dhcp_reply(struct dhcp_context *context, char *iface_name, int int_index,
 	    if (match_netid(context->filter, tagif_netid, 1) &&
 		is_same_net(mess->ciaddr, context->start, context->netmask))
 	      break;
-	  
-	  if (!service || !service->basename || !context)
+
+	  if (!service || (!service->basename || !service->basename[0]) || !context)
 	    return 0;
 	  	  
 	  clear_packet(mess, end);
 	  
 	  mess->yiaddr = mess->ciaddr;
 	  mess->ciaddr.s_addr = 0;
-	  if (service->sname)
+	  if (service->tftp_sname)
+	    mess->siaddr = a_record_from_hosts(service->tftp_sname, now);
+	  else if (service->tftp_server.s_addr != 0)
+	    mess->siaddr = service->tftp_server; 
+	  else if (service->sname)
 	    mess->siaddr = a_record_from_hosts(service->sname, now);
 	  else if (service->server.s_addr != 0)
 	    mess->siaddr = service->server; 
 	  else
 	    mess->siaddr = context->local; 
 	  
-	  if (strchr(service->basename, '.'))
-	    snprintf((char *)mess->file, sizeof(mess->file),
-		"%s", service->basename);
-	  else
-	    snprintf((char *)mess->file, sizeof(mess->file),
-		"%s.%d", service->basename, layer);
-	  
+    if (service->basename) {
+      const char * opt_fname = strchr(service->basename, '/');
+      opt_fname = opt_fname ? opt_fname : service->basename;
+      if (strchr(opt_fname, '.'))
+        snprintf((char *)mess->file, sizeof(mess->file),
+          "%s", service->basename);
+      else if (opt_fname[0])
+        snprintf((char *)mess->file, sizeof(mess->file),
+          "%s.%d", service->basename, layer);
+    }
+
 	  option_put(mess, end, OPTION_MESSAGE_TYPE, 1, DHCPACK);
 	  option_put(mess, end, OPTION_SERVER_IDENTIFIER, INADDRSZ, htonl(context->local.s_addr));
 	  pxe_misc(mess, end, uuid, pxevendor);
-	  
+	 
 	  prune_vendor_opts(tagif_netid);
 	  opt71.val = save71;
 	  opt71.opt = SUBOPT_PXE_BOOT_ITEM;
@@ -983,19 +1011,25 @@ size_t dhcp_reply(struct dhcp_context *context, char *iface_name, int int_index,
 		  /* Returns true if only one matching service is available. On port 4011, 
 		     it also inserts the boot file and server name. */
 		  workaround = pxe_uefi_workaround(pxearch, tagif_netid, mess, tmp->local, now, pxe);
-		  
+	    
 		  if (!workaround && boot)
 		    {
-		      /* Provide the bootfile here, for iPXE, and in case we have no menu items
-			 and set discovery_control = 8 */
-		      if (boot->next_server.s_addr) 
-			mess->siaddr = boot->next_server;
-		      else if (boot->tftp_sname) 
-			mess->siaddr = a_record_from_hosts(boot->tftp_sname, now);
-		      
-		      if (boot->file)
-			safe_strncpy((char *)mess->file, boot->file, sizeof(mess->file));
-		    }
+          /*
+             If the request is from iPXE, provide the boot server and bootfile
+          */
+          if ((mess_type == DHCPREQUEST || mess_type == DHCPINFORM) &&
+              (opt = option_find(mess, sz, 175, 1)))
+      {
+	      my_syslog(MS_DHCP | LOG_WARNING, _("iPXE special handling"));
+  	    if (boot->next_server.s_addr)
+	  	  	mess->siaddr = boot->next_server;
+  		  else if (boot->tftp_sname) 
+    		  mess->siaddr = a_record_from_hosts(boot->tftp_sname, now);
+
+  	  	if (boot->file)
+	  	  	safe_strncpy((char *)mess->file, boot->file, sizeof(mess->file));
+	    }
+        }
 		  
 		  option_put(mess, end, OPTION_MESSAGE_TYPE, 1, 
 			     mess_type == DHCPDISCOVER ? DHCPOFFER : DHCPACK);
@@ -2169,9 +2203,11 @@ static int pxe_uefi_workaround(int pxe_arch, struct dhcp_netid *netid, struct dh
   /* Only workaround UEFI archs. */
   if (pxe_arch < 6)
     return 0;
-  
+ 
   for (found = NULL, service = daemon->pxe_services; service; service = service->next)
-    if (pxe_arch == service->CSA && service->basename && match_netid(service->netid, netid, 1))
+    if (pxe_arch == service->CSA
+        && ((service->basename && service->basename[0]) || (service->server.s_addr && service->type))
+        && match_netid(service->netid, netid, 1))
       {
 	if (found)
 	  return 0; /* More than one relevant menu item */
@@ -2200,8 +2236,16 @@ static int pxe_uefi_workaround(int pxe_arch, struct dhcp_netid *netid, struct dh
       inet_ntop(AF_INET, &mess->siaddr, (char *)mess->sname, INET_ADDRSTRLEN);
     }
   
-  snprintf((char *)mess->file, sizeof(mess->file), 
-	   strchr(found->basename, '.') ? "%s" : "%s.0", found->basename);
+  if (found->basename) {
+    const char * opt_fname = strchr(found->basename, '/');
+    opt_fname = opt_fname ? opt_fname : found->basename;
+    if (strchr(opt_fname, '.'))
+      snprintf((char *)mess->file, sizeof(mess->file),
+        "%s", found->basename);
+    else if (opt_fname[0])
+      snprintf((char *)mess->file, sizeof(mess->file),
+        "%s.%d", found->basename, 0);
+  }
   
   return 1;
 }
@@ -2221,9 +2265,7 @@ static struct dhcp_opt *pxe_opts(int pxe_arch, struct dhcp_netid *netid, struct 
   static unsigned char fake_prompt[] = { 0, 'P', 'X', 'E' }; 
   static struct dhcp_opt *fake_opts = NULL;
   
-  /* Disable multicast, since we don't support it, and broadcast
-     unless we need it */
-  discovery_control = 3;
+  discovery_control = 0;
   
   ret = daemon->dhcp_opts;
   
@@ -2263,10 +2305,20 @@ static struct dhcp_opt *pxe_opts(int pxe_arch, struct dhcp_netid *netid, struct 
 	    return daemon->dhcp_opts;
 	  }
 	
+	/*
 	boot_server = service->basename ? local : 
 	  (service->sname ? a_record_from_hosts(service->sname, now) : service->server);
-	
-	if (boot_server.s_addr != 0)
+	*/
+	if (service->tftp_sname || service->tftp_server.s_addr)
+		boot_server = (service->tftp_sname
+                    ? a_record_from_hosts(service->tftp_sname, now)
+                    : (service->tftp_server.s_addr ? service->tftp_server : local));
+	else
+		boot_server = (service->sname
+                    ? a_record_from_hosts(service->sname, now)
+                    : (service->server.s_addr ? service->server : local));
+
+	if (service->type != 0 && boot_server.s_addr != 0)
 	  {
 	    if (q - (unsigned char *)daemon->dhcp_buff3 + 3 + INADDRSZ >= 253)
 	      goto toobig;
@@ -2278,18 +2330,36 @@ static struct dhcp_opt *pxe_opts(int pxe_arch, struct dhcp_netid *netid, struct 
 	    /* dest misaligned */
 	    memcpy(q, &boot_server.s_addr, INADDRSZ);
 	    q += INADDRSZ;
+    /*
+			 The client will broadcast the next DHCPREQUEST, thus obtaining
+       answers from all DHCP servers in the network, which creates all
+       sorts of transient effects and boot-loops. The client already
+       obtained a list of PXE services and a list of corresponding
+       next-servers. We now instruct the client to filter the
+       responses according to that list.
+     */
+      discovery_control |= 6;
 	  }
 	else if (service->type != 0)
+    {
 	  /* We don't know the server for a service type, so we'll
 	     allow the client to broadcast for it */
-	  discovery_control = 2;
-      }
+      discovery_control |= 2;
+    }
+
+      } /* for each service */
 
   /* if no prompt, wait forever if there's a choice */
   fake_prompt[0] = (i > 1) ? 255 : 0;
-  
+
+  if (discovery_control & 1)
+    {
+	      my_syslog(MS_DHCP | LOG_ERR, _("PXE with multicast discovery is not supported"));
+	      return 0;
+    }
+
   if (i == 0)
-    discovery_control = 8; /* no menu - just use use mess->filename */
+    discovery_control |= 8; /* no menu - just use use mess->filename */
   else
     {
       ret = &fake_opts[j--];
@@ -2464,10 +2534,14 @@ static void do_options(struct dhcp_context *context,
 	    safe_strncpy((char *)mess->file, boot->file, sizeof(mess->file));
 	}
       
-      if (boot->next_server.s_addr) 
+      if (boot->next_server.s_addr)
 	mess->siaddr = boot->next_server;
+      /*
       else if (boot->tftp_sname)
 	mess->siaddr = a_record_from_hosts(boot->tftp_sname, now);
+      else if (boot->tftp_server.s_addr)
+	mess->siaddr = boot->tftp_server;
+      */
     }
   else
     /* Use the values of the relevant options if no dhcp-boot given and

@@ -927,7 +927,9 @@ struct dhcp_match_name {
 struct pxe_service {
   unsigned short CSA, type; 
   char *menu, *basename, *sname;
+  char * tftp_sname;
   struct in_addr server;
+  struct in_addr tftp_server;
   struct dhcp_netid *netid;
   struct pxe_service *next;
 };
